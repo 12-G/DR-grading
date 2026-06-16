@@ -8,7 +8,7 @@ from sklearn.metrics import f1_score, cohen_kappa_score
 # metrics
 # -------------------------
 from data.utils import make_loader
-from model.backbone import TimmFeatureEncoder
+from model.backbone import TimmFeatureEncoder, DFViT, Backbone
 
 
 def compute_metrics(pred, label, average="macro"):
@@ -187,16 +187,21 @@ class TrainManager:
         print(f"Loaded checkpoint from {path} (epoch {ckpt['epoch']})")
 
 if __name__ == '__main__':
-    model = TimmFeatureEncoder(model_name='convnext_small.fb_in22k_ft_in1k_384')
+    # model = TimmFeatureEncoder(model_name='convnext_small.fb_in22k_ft_in1k_384')
+    model = Backbone()
     dr_image_root = "/root/autodl-tmp/baseline/AOR-DR/data/APTOS2019"
     dr_split_root = "/root/autodl-tmp/baseline/AOR-DR/data/splits"
     train_list = "APTOS_train_80.txt"
     val_list = "APTOS_val_20.txt"
     test_list = "APTOS_crossval.txt"
+    img_size = 224
 
-    dr_train_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, train_list), is_train=True)
-    dr_val_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, val_list), is_train=False)
-    dr_test_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, test_list), is_train=False)
+    dr_train_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, train_list), is_train=True,
+                                  img_size=img_size)
+    dr_val_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, val_list), is_train=False,
+                                img_size=img_size)
+    dr_test_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, test_list), is_train=False,
+                                 img_size=img_size)
     train_manager = TrainManager(model=model, train_loader=dr_test_loader, val_loader=dr_val_loader,
                                  test_loader=dr_test_loader)
     train_manager.fit(epochs=120)
