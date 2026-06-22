@@ -71,29 +71,25 @@ class TimmFeatureEncoder(nn.Module):
 
 
 class DFViT(nn.Module):
+
     def __init__(
-            self,
-            image_size=224,
-            patch_size=16,
-            in_chans=3,
-            embed_dim=512,
-            depth=4,
-            num_heads=8,
-            mlp_ratio=4,
-            dropout=0.1,
+        self,
+        image_size=224,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=512,
+        depth=1,
+        num_heads=8,
+        mlp_ratio=4,
+        dropout=0.1,
+        num_classes=5,
     ):
         super().__init__()
 
         assert image_size % patch_size == 0
 
-        self.image_size = image_size
-        self.patch_size = patch_size
-
         num_patches = (image_size // patch_size) ** 2
 
-        # ------------------
-        # Patch Embedding
-        # ------------------
         self.patch_embed = nn.Conv2d(
             in_chans,
             embed_dim,
@@ -101,20 +97,12 @@ class DFViT(nn.Module):
             stride=patch_size,
         )
 
-        # Position embedding
         self.pos_embed = nn.Parameter(
-            torch.randn(
-                1,
-                num_patches,
-                embed_dim
-            )
+            torch.randn(1, num_patches, embed_dim)
         )
 
         self.pos_drop = nn.Dropout(dropout)
 
-        # ------------------
-        # Transformer Encoder
-        # ------------------
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -136,30 +124,109 @@ class DFViT(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
 
-    def forward(self, x):
-        B = x.shape[0]
-        # patchify
-        x = self.patch_embed(x)
-        # [B,D,H',W']
+        self.cls_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, num_classes)
+        )
 
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-        # [B,N,D]
+        self.opt = torch.optim.AdamW(
+            self.parameters(),
+            lr=1e-3
+        )
+
+    def extract(self, x):
+
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
 
         x = x + self.pos_embed
-
         x = self.pos_drop(x)
 
-        x = self.encoder(x)
-        w = self.w_fc(x)
-        w = torch.sigmoid(w)
+        feat = self.encoder(x)
 
-        bk_area = (1 - w) * x
-        bk_area = torch.mean(bk_area, dim=1, keepdim=True)
+        w = torch.sigmoid(
+            self.w_fc(feat)
+        )
 
+        return feat, w
 
-        return cls_feat
+    @torch.no_grad()
+    def predict(self, x):
 
+        self.eval()
+
+        feat, w = self.extract(x)
+
+        front = (feat * w).sum(1) / (w.sum(1) + 1e-6)
+
+        logits = self.cls_head(front)
+
+        return logits.argmax(-1)
+
+    def bk_front_contrast(self, bk_area, front_area):
+
+        bk = F.normalize(
+            bk_area.squeeze(1),
+            dim=-1
+        )
+
+        front = F.normalize(
+            front_area.mean(1),
+            dim=-1
+        )
+
+        sim = (bk * front).sum(-1)
+
+        return sim.pow(2).mean()
+
+    def forward(self, x, label):
+
+        self.train()
+
+        feat, w = self.extract(x)
+
+        bk_area = ((1 - w) * feat).mean(1, keepdim=True)
+
+        front_area = w * feat
+
+        d_focus_loss = self.bk_front_contrast(
+            bk_area,
+            front_area
+        )
+
+        front_feat = (
+            front_area.sum(1)
+            / (w.sum(1) + 1e-6)
+        )
+
+        logits = self.cls_head(
+            front_feat
+        )
+
+        loss_cls = F.cross_entropy(
+            logits,
+            label
+        )
+
+        loss = (
+            loss_cls
+            + 0.2 * d_focus_loss
+        )
+
+        self.opt.zero_grad()
+
+        loss.backward()
+
+        self.opt.step()
+
+        train_info = {
+            "loss": loss.item(),
+            "cls": loss_cls.item(),
+            "focus": d_focus_loss.item(),
+            "fg_ratio": w.mean().item()
+        }
+
+        return logits, train_info
 
 class Backbone(nn.Module):
 
