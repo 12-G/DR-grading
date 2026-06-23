@@ -161,23 +161,79 @@ class DFViT(nn.Module):
 
         logits = self.cls_head(front)
 
-        return logits.argmax(-1)
+        return logits
 
-    def bk_front_contrast(self, bk_area, front_area):
+    def bk_front_contrast(
+            self,
+            bk_area,
+            front_area,
+            tau=0.1
+    ):
+        B, C, D = front_area.shape
 
+        # B D
         bk = F.normalize(
             bk_area.squeeze(1),
             dim=-1
         )
 
+        # B C D
         front = F.normalize(
-            front_area.mean(1),
+            front_area,
             dim=-1
         )
 
-        sim = (bk * front).sum(-1)
+        # --------------------
+        # 正样本：背景-背景
+        # B×B
+        # --------------------
+        pos = bk @ bk.T
 
-        return sim.pow(2).mean()
+        eye = torch.eye(
+            B,
+            device=bk.device,
+            dtype=torch.bool
+        )
+
+        pos = pos.masked_fill(
+            eye,
+            -1e9
+        )
+
+        pos = torch.logsumexp(
+            pos / tau,
+            dim=1
+        )
+
+        # --------------------
+        # 负样本：背景-所有前景
+        # B×B×C
+        # --------------------
+        neg = torch.einsum(
+            "bd,ncd->bnc",
+            bk,
+            front
+        )
+
+        neg = neg.reshape(
+            B,
+            B * C
+        )
+
+        neg = torch.logsumexp(
+            neg / tau,
+            dim=1
+        )
+
+        # --------------------
+        # InfoNCE
+        # --------------------
+        loss = -(pos - torch.logaddexp(
+            pos,
+            neg
+        ))
+
+        return loss.mean()
 
     def forward(self, x, label):
 

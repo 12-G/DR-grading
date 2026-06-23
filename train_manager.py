@@ -69,11 +69,11 @@ class TrainManager:
             loss = train_info["loss"]
 
             acc = (pred.argmax(-1) == label).float().mean()
-            total_loss += loss.item()
+            total_loss += loss
             total_acc += acc.item()
 
             if i % self.print_step == 0:
-                print(f"[Train] step={i} | loss={loss.item():.4f} | acc={acc.item():.4f}")
+                print(f"[Train] step={i} | loss={train_info} | acc={acc.item():.4f}")
 
         return {
             "loss": total_loss / len(self.train_loader),
@@ -188,7 +188,7 @@ class TrainManager:
 
 if __name__ == '__main__':
     # model = TimmFeatureEncoder(model_name='convnext_small.fb_in22k_ft_in1k_384')
-    model = Backbone()
+    model = DFViT()
     dr_image_root = "/root/autodl-tmp/baseline/AOR-DR/data/APTOS2019"
     dr_split_root = "/root/autodl-tmp/baseline/AOR-DR/data/splits"
     train_list = "APTOS_train_80.txt"
