@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torchvision import models
+from torchvision.models import MobileNet_V3_Small_Weights
+from torchvision.models.mobilenetv3 import InvertedResidual, InvertedResidualConfig
 
 
 class TimmFeatureEncoder(nn.Module):
@@ -77,6 +80,7 @@ class DFViT(nn.Module):
         image_size=224,
         patch_size=16,
         in_chans=3,
+        backbone_chans=48,
         embed_dim=512,
         depth=1,
         num_heads=8,
@@ -90,11 +94,12 @@ class DFViT(nn.Module):
 
         num_patches = (image_size // patch_size) ** 2
 
+        self.backbone = MobilenetV3Backbone()
+
         self.patch_embed = nn.Conv2d(
-            in_chans,
+            backbone_chans,
             embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
+            kernel_size=1,
         )
 
         self.pos_embed = nn.Parameter(
@@ -124,9 +129,9 @@ class DFViT(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
 
-        self.cls_head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Conv2d(in_channels=embed_dim, out_channels=backbone_chans, kernel_size=1),
+            MobileNetV3Classifier(num_classes=num_classes)
         )
 
         self.opt = torch.optim.AdamW(
@@ -134,9 +139,10 @@ class DFViT(nn.Module):
             lr=1e-3
         )
 
-    def extract(self, x):
-
+    def extract(self, x, need_fr_bk=False):
+        x = self.backbone(x)
         x = self.patch_embed(x)
+        B, C, H, W = x.shape
         x = x.flatten(2).transpose(1, 2)
 
         x = x + self.pos_embed
@@ -147,20 +153,19 @@ class DFViT(nn.Module):
         w = torch.sigmoid(
             self.w_fc(feat)
         )
+        front_area = w * feat
+        front_area_2d = front_area.transpose(1, 2).reshape(B, C, H, W)
+        if need_fr_bk:
+            bk_area = ((1 - w) * feat).mean(1, keepdim=True)
+            return front_area_2d, front_area, bk_area
 
-        return feat, w
+        return front_area_2d
 
     @torch.no_grad()
     def predict(self, x):
-
         self.eval()
-
-        feat, w = self.extract(x)
-
-        front = (feat * w).sum(1) / (w.sum(1) + 1e-6)
-
-        logits = self.cls_head(front)
-
+        front = self.extract(x)
+        logits = self.classifier(front)
         return logits
 
     def bk_front_contrast(
@@ -239,25 +244,13 @@ class DFViT(nn.Module):
 
         self.train()
 
-        feat, w = self.extract(x)
-
-        bk_area = ((1 - w) * feat).mean(1, keepdim=True)
-
-        front_area = w * feat
-
+        front_area_2d, front_area, bk_area = self.extract(x, need_fr_bk=True)
         d_focus_loss = self.bk_front_contrast(
             bk_area,
             front_area
         )
 
-        front_feat = (
-            front_area.sum(1)
-            / (w.sum(1) + 1e-6)
-        )
-
-        logits = self.cls_head(
-            front_feat
-        )
+        logits = self.classifier(front_area_2d)
 
         loss_cls = F.cross_entropy(
             logits,
@@ -279,134 +272,120 @@ class DFViT(nn.Module):
             "loss": loss.item(),
             "cls": loss_cls.item(),
             "focus": d_focus_loss.item(),
-            "fg_ratio": w.mean().item()
         }
 
         return logits, train_info
 
-class Backbone(nn.Module):
+
+class MobilenetV3Backbone(nn.Module):
+    def __init__(self):
+        super(MobilenetV3Backbone, self).__init__()
+        model = models.mobilenet_v3_small(
+            weights=MobileNet_V3_Small_Weights.DEFAULT
+        )
+        self.backbone = model.features[:8]
+
+    def forward(self, x):
+        x = self.backbone(x)
+        return x
+
+
+class MobileNetV3Classifier(nn.Module):
 
     def __init__(
-            self,
-            image_size=224,
-            patch_size=16,
-            in_chans=3,
-            num_classes=5,
-            embed_dim=768,
-            depth=12,
-            num_heads=12,
-            mlp_ratio=4,
-            dropout=0.1,
-            lr=1e-4,
+        self,
+        in_ch=48,
+        num_classes=10,
+        last_ch=576,
+        drop=0.2
     ):
         super().__init__()
 
-        assert image_size % patch_size == 0
+        self.blocks = nn.Sequential(
 
-        self.image_size = image_size
-        self.patch_size = patch_size
+            # 48×14×14
+            InvertedResidual(
+                InvertedResidualConfig(
+                    input_channels=in_ch,
+                    kernel=5,
+                    expanded_channels=288,
+                    out_channels=96,
+                    use_se=True,
+                    activation="HS",
+                    stride=2,
+                    dilation=1,
+                    width_mult=1.0
+                ),
+                norm_layer=nn.BatchNorm2d
+            ),
 
-        num_patches = (image_size // patch_size) ** 2
+            # 96×7×7
+            InvertedResidual(
+                InvertedResidualConfig(
+                    input_channels=96,
+                    kernel=5,
+                    expanded_channels=576,
+                    out_channels=96,
+                    use_se=True,
+                    activation="HS",
+                    stride=1,
+                    dilation=1,
+                    width_mult=1.0
+                ),
+                norm_layer=nn.BatchNorm2d
+            ),
 
-        # ------------------
-        # Patch Embedding
-        # ------------------
-        self.patch_embed = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-        )
-
-        # CLS token
-        self.cls_token = nn.Parameter(
-            torch.randn(1, 1, embed_dim)
-        )
-
-        # Position embedding
-        self.pos_embed = nn.Parameter(
-            torch.randn(
+            nn.Conv2d(
+                96,
+                last_ch,
                 1,
-                num_patches + 1,
-                embed_dim
+                bias=False
+            ),
+
+            nn.BatchNorm2d(last_ch),
+
+            nn.Hardswish()
+        )
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.cls = nn.Sequential(
+            nn.Flatten(),
+
+            nn.Linear(
+                last_ch,
+                1024
+            ),
+
+            nn.Hardswish(),
+
+            nn.Dropout(drop),
+
+            nn.Linear(
+                1024,
+                num_classes
             )
         )
 
-        self.pos_drop = nn.Dropout(dropout)
+    def forward(self, x):
 
-        # ------------------
-        # Transformer Encoder
-        # ------------------
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=int(embed_dim * mlp_ratio),
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
+        x = self.blocks(x)
 
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=depth
-        )
+        x = self.pool(x)
 
-        # 分类头
-        self.head = nn.Linear(
-            embed_dim,
-            num_classes
-        )
+        x = self.cls(x)
 
-        self.opt = torch.optim.AdamW(
-            self.parameters(),
-            lr=lr
-        )
+        return x
 
-        self.ce_loss = nn.CrossEntropyLoss()
 
-    def extract_feature(self, x):
-        """
-        x:
-        [B,C,H,W]
+class Backbone(nn.Module):
+    def __init__(
+            self,
+            image_size=224,
+    ):
+        super().__init__()
 
-        output:
-        [B,D]
-        """
 
-        B = x.shape[0]
-
-        # patchify
-        x = self.patch_embed(x)
-        # [B,D,H',W']
-
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-        # [B,N,D]
-
-        cls = self.cls_token.expand(B, -1, -1)
-
-        x = torch.cat(
-            [cls, x],
-            dim=1
-        )
-
-        x = x + self.pos_embed
-
-        x = self.pos_drop(x)
-
-        x = self.encoder(x)
-
-        cls_feat = x[:, 0]
-
-        return cls_feat
-
-    @torch.no_grad()
-    def predict(self, x):
-        self.eval()
-
-        logits = self.forward(x)
-
-        return logits.argmax(-1)
 
     def forward(self, img, label=None):
         feat = self.extract_feature(img)

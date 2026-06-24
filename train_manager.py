@@ -8,7 +8,7 @@ from sklearn.metrics import f1_score, cohen_kappa_score
 # metrics
 # -------------------------
 from data.utils import make_loader
-from model.backbone import TimmFeatureEncoder, DFViT, Backbone
+from model.dfnet import TimmFeatureEncoder, DFViT, Backbone
 
 
 def compute_metrics(pred, label, average="macro"):
