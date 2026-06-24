@@ -1,9 +1,10 @@
 import os
 import torch
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, cohen_kappa_score
-
-
 # -------------------------
 # metrics
 # -------------------------
@@ -30,17 +31,21 @@ def compute_metrics(pred, label, average="macro"):
     }
 
 
+
+
+
 class TrainManager:
     def __init__(
-        self,
-        model,
-        train_loader,
-        val_loader=None,
-        test_loader=None,
-        device="cuda",
-        use_amp=True,
-        save_dir="./checkpoints",
-        print_step=10,
+            self,
+            model,
+            train_loader,
+            val_loader=None,
+            test_loader=None,
+            device="cuda",
+            use_amp=True,
+            save_dir="./checkpoints",
+            print_step=10,
+            vis_step=50
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -48,9 +53,105 @@ class TrainManager:
         self.test_loader = test_loader
         self.device = device
         self.save_dir = save_dir
+        self.fig_save_dir = 'figs'
         os.makedirs(save_dir, exist_ok=True)
 
         self.print_step = print_step
+        self.vis_step = vis_step
+
+    def visualize_attention(
+            self,
+            img,
+            w,
+            step,
+            max_show=4
+    ):
+
+        # img: B×3×H×W
+        # w: B×H×W
+        w = w.reshape((-1, 14, 14))
+        B = min(max_show, img.shape[0])
+
+        fig, axes = plt.subplots(
+            B,
+            3,
+            figsize=(10, B * 4)
+        )
+
+        if B == 1:
+            axes = axes[None]
+
+        for i in range(B):
+
+            x = img[i]
+            att = w[i]
+
+            # CHW→HWC
+            x = x.permute(
+                1,
+                2,
+                0
+            ).numpy()
+
+            att = att.numpy()
+
+            # normalize
+            x = (
+                        x
+                        - x.min()
+                ) / (
+                        x.max()
+                        - x.min()
+                        + 1e-6
+                )
+
+            att = (
+                          att
+                          - att.min()
+                  ) / (
+                          att.max()
+                          - att.min()
+                          + 1e-6
+                  )
+
+            # 原图
+            axes[i, 0].imshow(x)
+            axes[i, 0].set_title("Fundus")
+
+            # attention
+            axes[i, 1].imshow(
+                att,
+                cmap="jet"
+            )
+            axes[i, 1].set_title("w")
+
+            # overlay
+            axes[i, 2].imshow(x)
+
+            axes[i, 2].imshow(
+                att,
+                cmap="jet",
+                alpha=0.5
+            )
+
+            axes[i, 2].set_title("Overlay")
+
+            for j in range(3):
+                axes[i, j].axis("off")
+
+        plt.tight_layout()
+
+        save_path = os.path.join(
+            self.fig_save_dir,
+            f"overlay_{step}.png"
+        )
+
+        plt.savefig(
+            save_path,
+            dpi=200
+        )
+
+        plt.close()
 
     # -------------------------
     # train step
@@ -66,14 +167,17 @@ class TrainManager:
             label = label.to(self.device, non_blocking=True)
 
             pred, train_info = self.model(img, label)
-            loss = train_info["loss"]
+            loss_stat = train_info["loss"]
+            loss = loss_stat['total']
 
             acc = (pred.argmax(-1) == label).float().mean()
             total_loss += loss
             total_acc += acc.item()
 
             if i % self.print_step == 0:
-                print(f"[Train] step={i} | loss={train_info} | acc={acc.item():.4f}")
+                print(f"[Train] step={i} | loss={loss_stat} | acc={acc.item():.4f}")
+            if i % self.vis_step == 0:
+                self.visualize_attention(img.detach().cpu(), train_info['w'], i)
 
         return {
             "loss": total_loss / len(self.train_loader),
@@ -186,6 +290,7 @@ class TrainManager:
 
         print(f"Loaded checkpoint from {path} (epoch {ckpt['epoch']})")
 
+
 if __name__ == '__main__':
     # model = TimmFeatureEncoder(model_name='convnext_small.fb_in22k_ft_in1k_384')
     model = DFViT()
@@ -202,6 +307,6 @@ if __name__ == '__main__':
                                 img_size=img_size)
     dr_test_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, test_list), is_train=False,
                                  img_size=img_size)
-    train_manager = TrainManager(model=model, train_loader=dr_test_loader, val_loader=dr_val_loader,
+    train_manager = TrainManager(model=model, train_loader=dr_train_loader, val_loader=dr_val_loader,
                                  test_loader=dr_test_loader)
     train_manager.fit(epochs=120)

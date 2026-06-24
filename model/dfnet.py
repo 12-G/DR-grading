@@ -124,9 +124,10 @@ class DFViT(nn.Module):
 
         self.w_fc = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
-            nn.LayerNorm(embed_dim // 2),
+            nn.LayerNorm([num_patches, embed_dim // 2]),
             nn.GELU(),
-            nn.Linear(embed_dim // 2, 1)
+            nn.Linear(embed_dim // 2, 1),
+            nn.LayerNorm([num_patches, 1]),
         )
 
         self.classifier = nn.Sequential(
@@ -157,7 +158,7 @@ class DFViT(nn.Module):
         front_area_2d = front_area.transpose(1, 2).reshape(B, C, H, W)
         if need_fr_bk:
             bk_area = ((1 - w) * feat).mean(1, keepdim=True)
-            return front_area_2d, front_area, bk_area
+            return front_area_2d, front_area, bk_area, w
 
         return front_area_2d
 
@@ -240,12 +241,23 @@ class DFViT(nn.Module):
 
         return loss.mean()
 
+    @staticmethod
+    def sparse_loss(w):
+        eps = 1e-8
+
+        entropy = (
+                -w * torch.log(w + eps)
+                - (1 - w) * torch.log(1 - w + eps)
+        )
+
+        return entropy.mean()
+
     def forward(self, x, label):
 
         self.train()
 
-        front_area_2d, front_area, bk_area = self.extract(x, need_fr_bk=True)
-        d_focus_loss = self.bk_front_contrast(
+        front_area_2d, front_area, bk_area, w = self.extract(x, need_fr_bk=True)
+        loss_focus = self.bk_front_contrast(
             bk_area,
             front_area
         )
@@ -257,9 +269,12 @@ class DFViT(nn.Module):
             label
         )
 
+        loss_sparse = self.sparse_loss(w)
+
         loss = (
             loss_cls
-            + 0.2 * d_focus_loss
+            + 0 * loss_focus
+            + 0 * loss_sparse
         )
 
         self.opt.zero_grad()
@@ -269,9 +284,11 @@ class DFViT(nn.Module):
         self.opt.step()
 
         train_info = {
-            "loss": loss.item(),
-            "cls": loss_cls.item(),
-            "focus": d_focus_loss.item(),
+            "loss": {'total': loss.item(),
+                     "cls": loss_cls.item(),
+                     "focus": loss_focus.item(),
+                     "sparse": loss_sparse.item()},
+            "w": w.detach().cpu(),
         }
 
         return logits, train_info

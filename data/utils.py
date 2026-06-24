@@ -93,4 +93,5 @@ def make_loader(images_root, splits_path, is_train=True, batch_size=32, num_work
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
+        drop_last=is_train,
     )
