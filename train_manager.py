@@ -2,6 +2,9 @@ import os
 import torch
 import numpy as np
 import matplotlib
+from torch import GradScaler
+from torch.amp import autocast
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import f1_score, cohen_kappa_score
@@ -31,9 +34,6 @@ def compute_metrics(pred, label, average="macro"):
     }
 
 
-
-
-
 class TrainManager:
     def __init__(
             self,
@@ -58,6 +58,40 @@ class TrainManager:
 
         self.print_step = print_step
         self.vis_step = vis_step
+        self.scaler = GradScaler()
+        self.optimizer = torch.optim.AdamW([
+            {
+                "params": model.backbone.parameters(),
+                "lr": 1e-5,
+                "weight_decay": 1e-6
+            },
+
+            {
+                "params":
+                    list(model.df1.parameters())
+                    + list(model.df2.parameters())
+                    + list(model.df3.parameters())
+                    + list(model.bn1.parameters())
+                    + list(model.bn2.parameters())
+                    + list(model.bn3.parameters()),
+
+                "lr": 3e-4,
+                "weight_decay": 0
+            },
+
+            {
+                "params":
+                    list(model.fc.parameters())
+                    + list(model.conv_pro_stem.parameters())
+                    + list(model.conv_pro_upper.parameters())
+                    + list(model.conv_pro_middel.parameters())
+                    + [model.threshold],
+
+                "lr": 1e-3,
+                "weight_decay": 0
+            }
+
+        ])
 
     def visualize_attention(
             self,
@@ -69,7 +103,7 @@ class TrainManager:
 
         # img: B×3×H×W
         # w: B×H×W
-        w = w.reshape((-1, 14, 14))
+        w = torch.squeeze(w, dim=1)
         B = min(max_show, img.shape[0])
 
         fig, axes = plt.subplots(
@@ -157,27 +191,46 @@ class TrainManager:
     # train step
     # -------------------------
     def train_one_epoch(self):
+
         self.model.train()
 
         total_loss = 0.0
         total_acc = 0.0
+
         print("\n")
+
         for i, (img, label) in enumerate(self.train_loader):
+
             img = img.to(self.device, non_blocking=True)
             label = label.to(self.device, non_blocking=True)
 
-            pred, train_info = self.model(img, label)
-            loss_stat = train_info["loss"]
-            loss = loss_stat['total']
+            self.optimizer.zero_grad(set_to_none=True)
 
-            acc = (pred.argmax(-1) == label).float().mean()
-            total_loss += loss
-            total_acc += acc.item()
+            # ================= AMP =================
+            with autocast(device_type="cuda"):
+
+                loss, train_info = self.model(img, label)
+
+            # backward（scaled）
+            self.scaler.scale(loss).backward()
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            # ======================================
+
+            loss_stat = train_info["loss"]
+
+            total_loss += loss.item()
 
             if i % self.print_step == 0:
-                print(f"[Train] step={i} | loss={loss_stat} | acc={acc.item():.4f}")
+                print(f"[Train] step={i} | loss={loss_stat}")
+
             if i % self.vis_step == 0:
-                self.visualize_attention(img.detach().cpu(), train_info['w'], i)
+                self.visualize_attention(
+                    img.detach().cpu(),
+                    train_info['w'],
+                    i
+                )
 
         return {
             "loss": total_loss / len(self.train_loader),
@@ -219,7 +272,7 @@ class TrainManager:
     # full training
     # -------------------------
     def fit(self, epochs):
-        best_qwk = -1e9
+        best_acc = -1e9
 
         for epoch in range(1, epochs + 1):
 
@@ -245,8 +298,8 @@ class TrainManager:
                 )
 
                 # save best
-                if val_metric["qwk"] > best_qwk:
-                    best_qwk = val_metric["qwk"]
+                if val_metric["acc"] > best_acc:
+                    best_acc = val_metric["acc"]
                     ck_path = self.save("best")
                     print(f"[Save] best model -> {ck_path}")
 
@@ -275,7 +328,6 @@ class TrainManager:
         torch.save(
             {
                 "model": self.model.state_dict(),
-                "optimizer": self.model.opt.state_dict(),
                 "epoch": epoch,
             },
             path,
@@ -294,19 +346,27 @@ class TrainManager:
 if __name__ == '__main__':
     # model = TimmFeatureEncoder(model_name='convnext_small.fb_in22k_ft_in1k_384')
     model = DFViT()
-    dr_image_root = "/root/autodl-tmp/baseline/AOR-DR/data/APTOS2019"
-    dr_split_root = "/root/autodl-tmp/baseline/AOR-DR/data/splits"
-    train_list = "APTOS_train_80.txt"
-    val_list = "APTOS_val_20.txt"
-    test_list = "APTOS_crossval.txt"
-    img_size = 224
+    # dr_image_root = "/root/autodl-tmp/baseline/AOR-DR/data/APTOS2019"
+    dr_image_root = "/root/autodl-tmp/baseline/LANet/DDR_preprocess1024"
+    # dr_split_root = "/root/autodl-tmp/baseline/AOR-DR/data/splits"
+    dr_split_root = "/root/autodl-tmp/baseline/LANet/DDR_preprocess1024"
+    # train_list = "APTOS_train_80.txt"
+    # val_list = "APTOS_val_20.txt"
+    # test_list = "APTOS_crossval.txt"
+    train_list = "train.txt"
+    val_list = "valid.txt"
+    test_list = "test.txt"
+    img_size = 512
 
-    dr_train_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, train_list), is_train=True,
-                                  img_size=img_size)
-    dr_val_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, val_list), is_train=False,
-                                img_size=img_size)
-    dr_test_loader = make_loader(dr_image_root, splits_path=os.path.join(dr_split_root, test_list), is_train=False,
-                                 img_size=img_size)
+    dr_train_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_train'),
+                                  splits_path=os.path.join(dr_split_root, train_list), is_train=True,
+                                  img_size=img_size, batch_size=8)
+    dr_val_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_valid'),
+                                splits_path=os.path.join(dr_split_root, val_list), is_train=False,
+                                img_size=img_size, batch_size=8)
+    dr_test_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_test'),
+                                 splits_path=os.path.join(dr_split_root, test_list), is_train=False,
+                                 img_size=img_size, batch_size=8)
     train_manager = TrainManager(model=model, train_loader=dr_train_loader, val_loader=dr_val_loader,
                                  test_loader=dr_test_loader)
     train_manager.fit(epochs=120)

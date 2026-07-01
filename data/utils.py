@@ -27,15 +27,17 @@ def build_transforms(
     if train:
         if strong_aug:
             ops = [
-                transforms.RandomResizedCrop(img_size, scale=(0.82, 1.0), ratio=(0.9, 1.1)),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=15),
-                transforms.ColorJitter(
-                    brightness=0.15, contrast=0.15, saturation=0.1, hue=0.0
-                ),
+                transforms.Resize((640, 640)),
+                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.2), ratio=(0.8, 1.2)),
+                transforms.RandomHorizontalFlip(),
+                transforms.RandomVerticalFlip(),
+                transforms.RandomRotation(degrees=(-180, 180)),
+                # transforms.ColorJitter(
+                #     brightness=0.15, contrast=0.15, saturation=0.1, hue=0.0
+                # ),
             ]
-            if smooth_op is not None:
-                ops.append(smooth_op)
+            # if smooth_op is not None:
+            #     ops.append(smooth_op)
             ops.extend(
                 [
                     transforms.ToTensor(),
@@ -54,8 +56,8 @@ def build_transforms(
         )
         return transforms.Compose(ops)
     ops = [transforms.Resize((img_size, img_size))]
-    if smooth_op is not None:
-        ops.append(smooth_op)
+    # if smooth_op is not None:
+    #     ops.append(smooth_op)
     ops.extend(
         [
             transforms.ToTensor(),
@@ -72,7 +74,7 @@ def make_loader(images_root, splits_path, is_train=True, batch_size=32, num_work
             transform = build_transforms(
                 img_size,
                 train=True,
-                strong_aug=False,
+                strong_aug=True,
                 gaussian_blur_sigma=gaussian_blur_sigma,
                 gaussian_blur_kernel=gaussian_blur_kernel,
             )
