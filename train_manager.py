@@ -45,7 +45,7 @@ class TrainManager:
             use_amp=True,
             save_dir="./checkpoints",
             print_step=10,
-            vis_step=50
+            vis_step=200
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
@@ -62,7 +62,7 @@ class TrainManager:
         self.optimizer = torch.optim.AdamW([
             {
                 "params": model.backbone.parameters(),
-                "lr": 1e-5,
+                "lr": 1e-4,
                 "weight_decay": 1e-6
             },
 
@@ -75,20 +75,22 @@ class TrainManager:
                     + list(model.bn2.parameters())
                     + list(model.bn3.parameters()),
 
-                "lr": 3e-4,
-                "weight_decay": 0
+                "lr": 1e-4,
+                "weight_decay": 1e-5
             },
 
             {
                 "params":
                     list(model.fc.parameters())
+                    + list(model.fc_score.parameters())
                     + list(model.conv_pro_stem.parameters())
                     + list(model.conv_pro_upper.parameters())
                     + list(model.conv_pro_middel.parameters())
+                    + list(model.fc_fusion.parameters())
                     + [model.threshold],
 
-                "lr": 1e-3,
-                "weight_decay": 0
+                "lr": 1e-4,
+                "weight_decay": 1e-5
             }
 
         ])
@@ -357,16 +359,17 @@ if __name__ == '__main__':
     val_list = "valid.txt"
     test_list = "test.txt"
     img_size = 512
+    batch_size = 8
 
     dr_train_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_train'),
                                   splits_path=os.path.join(dr_split_root, train_list), is_train=True,
-                                  img_size=img_size, batch_size=8)
+                                  img_size=img_size, batch_size=batch_size)
     dr_val_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_valid'),
                                 splits_path=os.path.join(dr_split_root, val_list), is_train=False,
-                                img_size=img_size, batch_size=8)
+                                img_size=img_size, batch_size=batch_size)
     dr_test_loader = make_loader(os.path.join(dr_image_root, 'preprocess1024_test'),
                                  splits_path=os.path.join(dr_split_root, test_list), is_train=False,
-                                 img_size=img_size, batch_size=8)
+                                 img_size=img_size, batch_size=batch_size)
     train_manager = TrainManager(model=model, train_loader=dr_train_loader, val_loader=dr_val_loader,
                                  test_loader=dr_test_loader)
     train_manager.fit(epochs=120)

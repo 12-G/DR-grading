@@ -3,7 +3,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torchvision import models
-from torchvision.models import MobileNet_V3_Small_Weights, efficientnet_v2_s, EfficientNet_V2_S_Weights
+from torchvision.models import MobileNet_V3_Small_Weights, efficientnet_v2_s, EfficientNet_V2_S_Weights, resnet50, \
+    ResNet50_Weights
 from torchvision.models.mobilenetv3 import InvertedResidual, InvertedResidualConfig
 
 
@@ -82,9 +83,9 @@ class DFModule(nn.Module):
             embed_dim=256,
             depth=2,
             num_heads=8,
-            mlp_ratio=4,
+            mlp_ratio=1,
             num_patches=4,
-            dropout=0,
+            dropout=0.2,
     ):
         super().__init__()
 
@@ -130,31 +131,16 @@ class DFModule(nn.Module):
         )
 
         self.w_fc = nn.Sequential(
-            nn.Conv2d(embed_dim, in_chans, kernel_size=1),
-            nn.InstanceNorm2d(in_chans),
+            nn.Conv2d(embed_dim, 1, kernel_size=1),
             nn.Sigmoid()
         )
 
-        self.w1_fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(embed_dim, in_chans, kernel_size=1),
-            nn.Sigmoid()
-        )
         self.chan_pro = nn.Sequential(
             nn.Conv2d(in_chans * 2, in_chans, kernel_size=1),
             nn.BatchNorm2d(in_chans),
             nn.SiLU(),
             nn.Conv2d(in_chans, in_chans, kernel_size=1),
         )
-
-        self.alpha_fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_chans, in_chans, kernel_size=1),
-            nn.LeakyReLU(),
-            nn.Conv2d(in_chans, 1, kernel_size=1),
-            nn.Sigmoid()
-        )
-
 
     # ======================
     # STN warp function
@@ -179,7 +165,6 @@ class DFModule(nn.Module):
         return x
 
     def forward(self, x):
-
         B, C, H, W = x.shape
 
         # ======================
@@ -191,7 +176,7 @@ class DFModule(nn.Module):
         # ======================
         x = self.patch_embed(x)
         x_flat = x.flatten(2).transpose(1, 2)
-        x_flat = self.ln(x_flat) #+ self.pe
+        # x_flat = self.ln(x_flat) + self.pe
         x_enc = self.encoder(x_flat)
 
         # w = self.w_fc(x_enc)
@@ -220,52 +205,134 @@ class DFModule(nn.Module):
         # front_2d =torch.cat((self.chan_pro(res), self.chan_pro(front_2d)), dim=1)
         # front_2d = torch.cat((res, front_2d), dim=1)
         # front_2d = self.chan_pro(front_2d)
-        return front_2d, torch.mean(w, dim=1, keepdim=True)
+        return front_2d, w
 
+
+class DFModuleV2(nn.Module):
+
+    def __init__(
+            self,
+            channels,
+            kernel_size=5,
+    ):
+        super().__init__()
+
+        pad = kernel_size // 2
+        self.conv_pro = nn.Sequential(
+            nn.Conv2d(
+                channels,
+                channels,
+                kernel_size=1,
+                padding=0,
+                # groups=channels,
+                bias=True,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid()
+        )
+
+        self.conv = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Conv2d(
+                channels * 2,
+                channels,
+                kernel_size=1,
+                padding=0,
+                bias=True,
+            ),
+            nn.BatchNorm2d(channels),
+            nn.Tanh(),
+        )
+        self.bk_pool = nn.Sequential(
+            nn.Conv2d(in_channels=channels, out_channels=channels, kernel_size=kernel_size, stride=1,
+                      padding_mode='replicate', padding=pad, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.Sigmoid()
+        )
+
+        self.kernel_size = kernel_size
+        self.pad = pad
+
+    def forward(self, x):
+        # local mean
+        res = x
+        x = self.conv_pro(x)
+        mean = self.bk_pool(x)
+        # local variance
+        diff = torch.abs(x - mean)
+        x = torch.cat((diff[:, None], x[:, None]), dim=1)
+        x = x.reshape(x.size(0), -1, x.size(-2), x.size(-1))
+        # std = torch.sqrt(var + 1e-6)
+        # std = torch.log1p(std)
+        w = self.conv(x) + 1
+        out = res * w
+
+        return out, w# torch.mean(w, dim=1, keepdim=True)
+
+
+def levels_from_label(label, num_classes):
+    levels = torch.zeros(
+        label.size(0),
+        num_classes - 1,
+        device=label.device
+    )
+
+    for i in range(num_classes - 1):
+        levels[:, i] = (label > i).float()
+
+    return levels
 
 
 class DFViT(nn.Module):
 
     def __init__(
-        self,
-        num_classes=5,
+            self,
+            num_classes=5,
     ):
         super().__init__()
 
         self.backbone = EfficientNetV2Backbone(num_classes=num_classes)
 
         # DF blocks at semantic stages
-        self.df1 = DFModule(in_chans=64, embed_dim=128, num_heads=4)
+        self.df1 = DFModuleV2(channels=64, kernel_size=3)#DFModule(in_chans=64, embed_dim=64, num_heads=1, num_patches=4096)
         self.bn1 = nn.BatchNorm2d(64)
-        self.df2 = DFModule(in_chans=160, embed_dim=256, num_patches=1024)
-        self.bn2 = nn.BatchNorm2d(160)
-        self.df3 = DFModule(in_chans=256, embed_dim=512, num_patches=256)
+        self.df2 = DFModuleV2(channels=128, kernel_size=3)#DFModule(in_chans=128, embed_dim=256, num_patches=1024)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.df3 = DFModuleV2(channels=256, kernel_size=3)#DFModule(in_chans=256, embed_dim=512, num_patches=256)
         self.bn3 = nn.BatchNorm2d(256)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.num_classes = num_classes
-        self.conv_pro_stem = nn.Sequential(
-            nn.Conv2d(64, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.SiLU()
-        )
-        self.conv_pro_upper = nn.Sequential(
-            nn.Conv2d(160, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.SiLU()
-        )
+        self.conv_pro_stem = self.get_conv_pro(64, 512, stride=[2, 2])
+        self.conv_pro_upper = self.get_conv_pro(128, 512, stride=[2, 1])
         self.conv_pro_middel = nn.Sequential(
+            nn.Dropout(0.3),
             nn.Conv2d(256, 512, kernel_size=1),
-            nn.BatchNorm2d(512),
-            nn.SiLU()
         )
+
+        self.fc_fusion = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(512 * 3, 1024, kernel_size=1),
+            nn.BatchNorm2d(1024),
+            nn.Sigmoid(),
+            nn.Conv2d(1024, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.Sigmoid()
+        )
+
         self.fc = nn.Sequential(
-            nn.Linear(512 * 3, 256),
-            nn.LeakyReLU(),
-            nn.Linear(256, num_classes),
+            nn.Dropout(0.2),
+            nn.Linear(1280 + 64 + 128, 128),
+            nn.BatchNorm1d(128),
+            nn.Sigmoid(),
+            nn.Linear(128, num_classes - 1),
         )
-        self.register_buffer("proto_normal", torch.zeros(512 * 3))
+        self.fc_score = nn.Sequential(
+            nn.Linear(256, 1),
+        )
+        self.register_buffer("proto_normal", torch.zeros(256))
         self.register_buffer("proto_init", torch.tensor(0))
-        self.proto_momentum = 0.99
+        self.max_pool = nn.MaxPool2d(2, stride=2)
+        self.proto_momentum = 0
         self.threshold = nn.Parameter(
             torch.tensor([
                 0.5,
@@ -275,40 +342,61 @@ class DFViT(nn.Module):
             ])
         )
 
+    def get_conv_pro(self, in_channels, out_channels, stride):
+        return nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Conv2d(in_channels, in_channels, groups=in_channels, kernel_size=3, padding=1, stride=stride[0]),
+            nn.BatchNorm2d(in_channels),
+            nn.Sigmoid(),
+            nn.Conv2d(in_channels, out_channels, groups=in_channels, kernel_size=3, stride=stride[1], padding=1),
+        )
+
     def extract(self, x, need_fr_bk=False):
         x = self.backbone.stem(x)
         x = self.backbone.stage1(x)
         x = self.backbone.stage2(x)
+
         x = self.backbone.stage3(x)
         res = x
-        x, w = self.df1(x)
-        x = x + res
-        x = self.bn1(x)
-        df_x1 = x
-        # df_x1 = F.adaptive_avg_pool2d(df_x1, 1).flatten(1)
+        x, w1 = self.df1(x)
+        if not torch.isfinite(x).all():
+            print(x, w1)
+            raise ValueError("proto_normal introduced NaN or Inf")
+        x = self.bn1(x) # + res
+        # x = self.max_pool(x)
+        x_cl1 = F.adaptive_avg_pool2d(x, 1).flatten(1)
         x = self.backbone.stage4(x)
-        x = self.backbone.stage5(x)
         res = x
-        x, w = self.df2(x)
-        x = x + res
-        x = self.bn2(x)
-        df_x2 = x
-        df_x2_pool = F.adaptive_avg_pool2d(df_x2, 1).flatten(1)
+        x, w2 = self.df2(x)
+        if not torch.isfinite(x).all():
+            print(x, w2)
+            raise ValueError("proto_normal introduced NaN or Inf")
+        x = self.bn2(x) # + res
+        x_cl2 = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        x = self.backbone.stage5(x)
         x = self.backbone.stage6(x)
         # hidden = F.adaptive_avg_pool2d(x, 1).flatten(1)
-        # x, _ = self.df3(x)
-        # x = self.bn3(x)
+        res = x
+        x, w3 = self.df3(x)
+        if not torch.isfinite(x).all():
+            print(x, w3)
+            raise ValueError("proto_normal introduced NaN or Inf")
+        x = self.bn3(x) # + res
+        x = self.backbone.stage7(x)
+        x_cl3 = self.pool(x).flatten(1)
         # df_x3 = x
         # df_x3_pool = F.adaptive_avg_pool2d(df_x3, 1).flatten(1)
-        df_x1 = self.conv_pro_stem(df_x1)
-        df_x1 = self.pool(df_x1)
-        df_x2 = self.conv_pro_upper(df_x2)
-        df_x2 = self.pool(df_x2)
-        df_x3 = self.conv_pro_middel(x)
-        df_x3 = self.pool(df_x3)
-        x = torch.cat((df_x1, df_x2, df_x3), dim=1)
+        df_x1 = self.conv_pro_stem(w1)
+        # df_x1 = self.pool(df_x1)
+        df_x2 = self.conv_pro_upper(w2)
+        # df_x2 = self.pool(df_x2)
+        df_x3 = self.conv_pro_middel(w3)
+        # df_x3 = self.pool(df_x3)
+        df_full = torch.cat((df_x1, df_x2, df_x3), dim=1)
+        df_full = self.fc_fusion(df_full)
+        x = torch.cat((x_cl1, x_cl2, x_cl3), dim=1)
         if need_fr_bk:
-            return x, [x.squeeze()], w
+            return x, [df_full.squeeze()], torch.mean(w2, dim=1, keepdim=True)
         return x
 
     def score_to_onehot(
@@ -345,7 +433,10 @@ class DFViT(nn.Module):
             feat
         )
 
-        return pred
+        pred = (torch.sigmoid(pred) > 0.5).sum(dim=1)
+        logit = self.score_to_onehot(pred)
+
+        return logit
 
     def bk_front_contrast(
             self,
@@ -397,32 +488,41 @@ class DFViT(nn.Module):
 
         return loss.mean()
 
-    @staticmethod
     def disease_normal_loss(
+            self,
             feat,
             y,
             proto_normal,
-            margin=0.3,
-            eps=1e-6
-    ):
+            eps=1e-6):
+
+        if self.proto_init == 0:
+            return feat.new_tensor(0.)
 
         feat = F.normalize(feat, dim=-1, eps=eps)
         proto = F.normalize(proto_normal, dim=-1, eps=eps)
 
+        sim = torch.sum(feat * proto, dim=-1)
+
         loss = feat.new_tensor(0.)
 
+        # ---------- normal ----------
         normal_mask = (y == 0)
+        if normal_mask.any():
+            loss += F.relu(0.85 - sim[normal_mask]).mean()
+
+        # ---------- disease ----------
+        # target_sim = torch.tensor(
+        #     [0.85, 0.70, 0.55, 0.40, 0.25],
+        #     device=feat.device)
+
         disease_mask = (y > 0)
 
-        # ========== normal compact ==========
-        if normal_mask.any():
-            sim_n = torch.sum(feat[normal_mask] * proto, dim=-1)
-            loss = loss + (1 - sim_n).mean()
-
-        # ========== disease separation ==========
         if disease_mask.any():
-            sim_d = torch.sum(feat[disease_mask] * proto, dim=-1)
-            loss = loss + F.relu(sim_d - margin).mean()
+            # target = target_sim[y[disease_mask]]
+
+            loss += F.relu(
+                sim[disease_mask] - 0.5
+            ).mean()
 
         return loss
 
@@ -434,14 +534,18 @@ class DFViT(nn.Module):
             if normal.shape[0] == 0:
                 return
 
-            batch_proto = normal.mean(dim=0)
-
+            batch_proto = normal.detach().mean(dim=0)
+            if not torch.isfinite(batch_proto).all():
+                print(feat[y == 0])
+                raise ValueError("batch_proto contains NaN or Inf")
             if self.proto_init == 0:
                 self.proto_normal.copy_(batch_proto)
                 self.proto_init.fill_(1)
             else:
                 self.proto_normal.mul_(self.proto_momentum)
                 self.proto_normal.add_(batch_proto * (1 - self.proto_momentum))
+            if not torch.isfinite(self.proto_normal).all():
+                raise ValueError("proto_normal introduced NaN or Inf")
 
     @staticmethod
     def ranking_loss(
@@ -513,8 +617,15 @@ class DFViT(nn.Module):
         # )
         # logits_mix = self.backbone.stage2(mix_area_2d)
         # front_area_2d = self.backbone.stage7(front_area_2d)
+
+        coral_target = levels_from_label(label, self.num_classes)
+
         x = front_area_2d.flatten(1)
-        logits = self.fc(x)# .squeeze(-1)
+        logits = self.fc(x)  # .squeeze(-1)
+        loss_cls = F.binary_cross_entropy_with_logits(
+            logits,
+            coral_target
+        )
 
         # ====================
         # 2. Probability
@@ -533,10 +644,8 @@ class DFViT(nn.Module):
             dtype=prob.dtype
         )
 
-        score = (
-                prob *
-                bins[None]
-        ).sum(-1)
+        # x = front_area_2d.flatten(1)
+        # score = self.fc_score(x).squeeze(-1)
 
         # loss_cls = F.cross_entropy(logits, label) #+ F.cross_entropy(bk_logits, torch.zeros_like(label))
         loss_dis = 0
@@ -550,14 +659,14 @@ class DFViT(nn.Module):
             # loss_dis += self.disease_normal_loss(df_feat, label)
 
         loss_active = 0
-        loss_cls = 0.1 * F.smooth_l1_loss(
-            score,
-            label.float()
-        ) + F.cross_entropy(logits, label)
+        # loss_cls = 0 * F.smooth_l1_loss(
+        #     score,
+        #     label.float()
+        # ) + F.cross_entropy(logits, label)
         loss = (
-            loss_cls # + 0.1 * loss_rank
-            + 0 * loss_dis
-            + 0 * loss_active
+                loss_cls  # + 0.1 * loss_rank
+                + 0.1 * loss_dis
+                + 0 * loss_active
             # + 0 * loss_sparse
         )
 
@@ -582,16 +691,69 @@ class ConvNeXtBackbone(nn.Module):
             "convnext_tiny",
             pretrained=pretrained,
             features_only=True,
-            out_indices=(2,)   # stage3
+            out_indices=(2,)  # stage3
         )
 
         self.out_channels = 192
 
     def forward(self, x):
-
         x = self.backbone(x)[0]
 
         # B x 192 x 14 x 14
+        return x
+
+
+class ResNet50Backbone(nn.Module):
+
+    def __init__(self, num_classes=5):
+        super().__init__()
+
+        model = resnet50(
+            weights=ResNet50_Weights.DEFAULT
+        )
+
+        # stem
+        self.stem = nn.Sequential(
+            model.conv1,
+            model.bn1,
+            model.relu,
+            model.maxpool,
+        )
+
+        # ResNet stages
+        self.stage1 = model.layer1      # 256 channels
+        self.stage2 = model.layer2      # 512 channels
+        self.stage3 = model.layer3      # 1024 channels
+        self.stage4 = model.layer4      # 2048 channels
+
+        # 为了与你原来的接口一致，保留空stage
+        self.stage5 = nn.Identity()
+        self.stage6 = nn.Identity()
+        self.stage7 = nn.Identity()
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.fc = nn.Linear(2048, num_classes)
+
+    def forward_features(self, x):
+
+        x = self.stem(x)
+
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+
+        return x
+
+    def forward(self, x):
+
+        x = self.forward_features(x)
+
+        x = self.pool(x).flatten(1)
+
+        x = self.fc(x)
+
         return x
 
 
@@ -606,12 +768,12 @@ class EfficientNetV2Backbone(nn.Module):
 
         self.stem = model.features[0]
 
-        self.stage1 = model.features[1:2]   # 24ch
-        self.stage2 = model.features[2:3]   # 48ch
-        self.stage3 = model.features[3:4]   # 64ch
-        self.stage4 = model.features[4:5]   # 128ch
-        self.stage5 = model.features[5:6]   # 160ch
-        self.stage6 = model.features[6:7]    # 256ch
+        self.stage1 = model.features[1:2]  # 24ch
+        self.stage2 = model.features[2:3]  # 48ch
+        self.stage3 = model.features[3:4]  # 64ch
+        self.stage4 = model.features[4:5]  # 128ch
+        self.stage5 = model.features[5:6]  # 160ch
+        self.stage6 = model.features[6:7]  # 256ch
         self.stage7 = model.features[7:]  # 256ch
 
         self.pool = nn.AdaptiveAvgPool2d(1)
@@ -619,7 +781,6 @@ class EfficientNetV2Backbone(nn.Module):
         self.fc = nn.Linear(1280, num_classes)
 
     def forward_features(self, x):
-
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
@@ -631,7 +792,6 @@ class EfficientNetV2Backbone(nn.Module):
         return x
 
     def forward(self, x):
-
         x = self.forward_features(x)
         x = self.pool(x).flatten(1)
         x = self.fc(x)
@@ -655,11 +815,11 @@ class MobilenetV3Backbone(nn.Module):
 class MobileNetV3Classifier(nn.Module):
 
     def __init__(
-        self,
-        in_ch=128,
-        num_classes=10,
-        last_ch=576,
-        drop=0.2
+            self,
+            in_ch=128,
+            num_classes=10,
+            last_ch=576,
+            drop=0.2
     ):
         super().__init__()
 
@@ -730,7 +890,6 @@ class MobileNetV3Classifier(nn.Module):
         )
 
     def forward(self, x):
-
         x = self.blocks(x)
 
         x = self.pool(x)
@@ -746,8 +905,6 @@ class Backbone(nn.Module):
             image_size=224,
     ):
         super().__init__()
-
-
 
     def forward(self, img, label=None):
         feat = self.extract_feature(img)

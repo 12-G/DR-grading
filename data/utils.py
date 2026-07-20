@@ -3,8 +3,8 @@ from torchvision.transforms import transforms
 
 from data.base_dataset import BaseDataset
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+IMAGENET_MEAN = (.426, .298, .213)
+IMAGENET_STD = (.277, .203, .169)
 
 
 def build_transforms(
@@ -28,9 +28,10 @@ def build_transforms(
         if strong_aug:
             ops = [
                 transforms.Resize((640, 640)),
-                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.2), ratio=(0.8, 1.2)),
+
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
+                transforms.RandomResizedCrop(img_size, scale=(0.8, 1.2), ratio=(0.8, 1.2)),
                 transforms.RandomRotation(degrees=(-180, 180)),
                 # transforms.ColorJitter(
                 #     brightness=0.15, contrast=0.15, saturation=0.1, hue=0.0
